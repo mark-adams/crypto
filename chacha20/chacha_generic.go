@@ -11,7 +11,7 @@ const rounds = 20
 
 // core applies the ChaCha20 core function to 16-byte input in, 32-byte key k,
 // and 16-byte constant c, and puts the result into 64-byte array out.
-func core(out *[64]byte, in *[16]byte, k *[32]byte) {
+func GetBlock(out *[64]byte, in *[16]byte, k *[32]byte) {
 	j0 := uint32(0x61707865)
 	j1 := uint32(0x3320646e)
 	j2 := uint32(0x79622d32)
@@ -175,7 +175,7 @@ func XORKeyStream(out, in []byte, counter *[16]byte, key *[32]byte) {
 	copy(counterCopy[:], counter[:])
 
 	for len(in) >= 64 {
-		core(&block, &counterCopy, key)
+		GetBlock(&block, &counterCopy, key)
 		for i, x := range block {
 			out[i] = in[i] ^ x
 		}
@@ -190,7 +190,7 @@ func XORKeyStream(out, in []byte, counter *[16]byte, key *[32]byte) {
 	}
 
 	if len(in) > 0 {
-		core(&block, &counterCopy, key)
+		GetBlock(&block, &counterCopy, key)
 		for i, v := range in {
 			out[i] = v ^ block[i]
 		}

@@ -16,9 +16,10 @@ import (
 const debugTransport = false
 
 const (
-	gcmCipherID    = "aes128-gcm@openssh.com"
-	aes128cbcID    = "aes128-cbc"
-	tripledescbcID = "3des-cbc"
+	gcmCipherID        = "aes128-gcm@openssh.com"
+	aes128cbcID        = "aes128-cbc"
+	tripledescbcID     = "3des-cbc"
+	chacha20poly1305ID = "chacha20-poly1305@openssh.com"
 )
 
 // packetConn represents a transport that implements packet based
@@ -255,6 +256,10 @@ func newPacketCipher(d direction, algs directionAlgorithms, kex *kexResult) (pac
 
 	if algs.Cipher == gcmCipherID {
 		return newGCMCipher(iv, key, macKey)
+	}
+
+	if algs.Cipher == chacha20poly1305ID {
+		return newChacha20Poly1305Cipher(key)
 	}
 
 	if algs.Cipher == aes128cbcID {

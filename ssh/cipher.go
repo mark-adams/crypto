@@ -16,6 +16,10 @@ import (
 	"hash"
 	"io"
 	"io/ioutil"
+
+	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/poly1305"
 )
 
 const (
@@ -115,6 +119,9 @@ var cipherModes = map[string]*streamCipherMode{
 	// special case. If we add any more non-stream ciphers, we
 	// should invest a cleaner way to do this.
 	gcmCipherID: {16, 12, 0, nil},
+
+	// ChaCha20-Poly1305
+	chacha20poly1305ID: {64, 0, 0, nil},
 
 	// CBC mode is insecure and so is not included in the default config.
 	// (See http://www.isg.rhul.ac.uk/~kp/SandPfinal.pdf). If absolutely
@@ -403,6 +410,149 @@ func (c *gcmCipher) readPacket(seqNum uint32, r io.Reader) ([]byte, error) {
 	}
 	plain = plain[1 : length-uint32(padding)]
 	return plain, nil
+}
+
+type chacha20Poly1305Cipher struct {
+	lenKey [32]byte
+	key    [32]byte
+
+	// The following members are to avoid per-packet allocations.
+	length      [4]byte
+	seqNumBytes [8]byte
+	nonce       [16]byte
+	padding     [7]byte
+	packetData  []byte
+}
+
+func newChacha20Poly1305Cipher(key []byte) (packetCipher, error) {
+	c := &chacha20Poly1305Cipher{}
+	copy(c.key[:], key[:32])
+	copy(c.lenKey[:], key[32:])
+
+	return c, nil
+}
+
+func (c *chacha20Poly1305Cipher) writePacket(seqnum uint32, w io.Writer, rand io.Reader, packet []byte) error {
+	fmt.Printf("%+v\n", packet)
+	// The server expects that our packet body's length so we add random bytes for padding
+	paddingLength := 8 - (len(packet)+1)%8
+	if paddingLength == 8 {
+		paddingLength = 0
+	}
+	if _, err := io.ReadFull(rand, c.padding[:paddingLength]); err != nil {
+		return fmt.Errorf("ssh: error generating random paddding: %v", err)
+	}
+
+	pkt := []byte{byte(paddingLength)}
+	pkt = append(pkt, packet...)
+	pkt = append(pkt, c.padding[:paddingLength]...)
+	packet = pkt
+
+	binary.BigEndian.PutUint64(c.seqNumBytes[:], uint64(seqnum))
+	aead, err := c.getAEAD(c.seqNumBytes[:])
+	if err != nil {
+		return fmt.Errorf("ssh: error initializing AEAD for packet: %v", err)
+	}
+
+	// Reinitialize nonce to {1, 0..., seqnum}
+	nonce := c.nonce[:12]
+	nonce[0] = 1
+	for i := 1; i < len(nonce); i++ {
+		nonce[i] = 0
+	}
+	copy(nonce[4:], c.seqNumBytes[:])
+
+	// Encrypt the packet
+	packet = aead.Seal(packet[:0], nonce, packet[:], nil)
+
+	// Reinitialize nonce to {0, 0..., seqnum}
+	for i := 0; i < 8; i++ {
+		c.nonce[i] = 0
+	}
+	copy(c.nonce[8:], c.seqNumBytes[:])
+
+	binary.BigEndian.PutUint32(c.length[:], uint32(len(packet)))
+
+	// Encrypt the packet length
+	chacha20.XORKeyStream(c.length[:], c.length[:], &c.nonce, &c.lenKey)
+
+	if _, err = w.Write(c.length[:]); err != nil {
+		return fmt.Errorf("ssh: error writing packet length: %v", err)
+	}
+
+	if _, err = w.Write(packet); err != nil {
+		return fmt.Errorf("ssh: error writing packet: %v", err)
+	}
+
+	return nil
+}
+
+func (c *chacha20Poly1305Cipher) readPacket(seqnum uint32, r io.Reader) ([]byte, error) {
+	_, err := r.Read(c.length[:])
+	if err != nil {
+		return nil, fmt.Errorf("ssh: error reading packet length: %v", err)
+	}
+
+	binary.BigEndian.PutUint64(c.seqNumBytes[:], uint64(seqnum))
+
+	// Reinitialize nonce to {0, 0..., seqnum}
+	for i := 0; i < 8; i++ {
+		c.nonce[i] = 0
+	}
+	copy(c.nonce[8:], c.seqNumBytes[:])
+
+	// Decrypt the packet length
+	chacha20.XORKeyStream(c.length[:], c.length[:], &c.nonce, &c.lenKey)
+
+	length := binary.BigEndian.Uint32(c.length[:])
+
+	if len(c.packetData) < int(length) {
+		c.packetData = make([]byte, length)
+	} else {
+		c.packetData = c.packetData[:length]
+	}
+
+	_, err = r.Read(c.packetData)
+	if err != nil {
+		return nil, fmt.Errorf("ssh: error reading packet payload: %v", err)
+	}
+
+	aead, err := c.getAEAD(c.seqNumBytes[:])
+	if err != nil {
+		return nil, fmt.Errorf("ssh: error initializing AEAD for packet: %v", err)
+	}
+
+	// Reinitialize ctr to {1, 0..., seqnum}
+	nonce := c.nonce[:12]
+	nonce[0] = 1
+	for i := 1; i < len(nonce); i++ {
+		nonce[i] = 0
+	}
+	copy(nonce[4:], c.seqNumBytes[:])
+
+	// Decrypt the packet payload
+	c.packetData, err = aead.Open(c.packetData[:0], nonce[:], c.packetData, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ssh: error decrypting packet: %v", err)
+	}
+	paddingLength := uint32(c.packetData[0])
+	result := c.packetData[1 : length-paddingLength-poly1305.TagSize]
+	fmt.Printf("%+v\n", result)
+	return result, nil
+
+}
+
+func (c *chacha20Poly1305Cipher) getAEAD(seqnum []byte) (cipher.AEAD, error) {
+	var polyKeyResult [64]byte
+
+	// Initialize counter to {seqnum, 0...}
+	var nonce [16]byte
+	copy(nonce[:8], seqnum)
+
+	// Generate the poly1305 key for payload decryption
+	chacha20.GetBlock(&polyKeyResult, &nonce, &c.key)
+
+	return chacha20poly1305.New(polyKeyResult[:32])
 }
 
 // cbcCipher implements aes128-cbc cipher defined in RFC 4253 section 6.1
