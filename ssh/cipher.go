@@ -417,11 +417,12 @@ type chacha20Poly1305Cipher struct {
 	key    [32]byte
 
 	// The following members are to avoid per-packet allocations.
-	length      [4]byte
-	seqNumBytes [8]byte
-	nonce       [16]byte
-	padding     [7]byte
-	packetData  []byte
+	length          [4]byte
+	encryptedLength [4]byte
+	seqNumBytes     [8]byte
+	nonce           [16]byte
+	padding         [7]byte
+	packetData      []byte
 }
 
 func newChacha20Poly1305Cipher(key []byte) (packetCipher, error) {
@@ -433,7 +434,7 @@ func newChacha20Poly1305Cipher(key []byte) (packetCipher, error) {
 }
 
 func (c *chacha20Poly1305Cipher) writePacket(seqnum uint32, w io.Writer, rand io.Reader, packet []byte) error {
-	fmt.Printf("%+v\n", packet)
+	fmt.Printf("write original: %+v\n", packet)
 	// The server expects that our packet body's length so we add random bytes for padding
 	paddingLength := 8 - (len(packet)+1)%8
 	if paddingLength == 8 {
@@ -454,6 +455,16 @@ func (c *chacha20Poly1305Cipher) writePacket(seqnum uint32, w io.Writer, rand io
 		return fmt.Errorf("ssh: error initializing AEAD for packet: %v", err)
 	}
 
+	// Reinitialize nonce to {0, 0..., seqnum}
+	for i := 0; i < 8; i++ {
+		c.nonce[i] = 0
+	}
+	copy(c.nonce[8:], c.seqNumBytes[:])
+
+	// Encrypt the packet length
+	binary.BigEndian.PutUint32(c.length[:], uint32(len(packet)))
+	chacha20.XORKeyStream(c.length[:], c.length[:], &c.nonce, &c.lenKey)
+
 	// Reinitialize nonce to {1, 0..., seqnum}
 	nonce := c.nonce[:12]
 	nonce[0] = 1
@@ -462,24 +473,13 @@ func (c *chacha20Poly1305Cipher) writePacket(seqnum uint32, w io.Writer, rand io
 	}
 	copy(nonce[4:], c.seqNumBytes[:])
 
-	// Encrypt the packet
-	packet = aead.Seal(packet[:0], nonce, packet[:], nil)
-
-	// Reinitialize nonce to {0, 0..., seqnum}
-	for i := 0; i < 8; i++ {
-		c.nonce[i] = 0
-	}
-	copy(c.nonce[8:], c.seqNumBytes[:])
-
-	binary.BigEndian.PutUint32(c.length[:], uint32(len(packet)))
-
-	// Encrypt the packet length
-	chacha20.XORKeyStream(c.length[:], c.length[:], &c.nonce, &c.lenKey)
+	// Encrypt the packet (with length as AAD)
+	packet = aead.Seal(packet[:0], nonce, packet[:], c.encryptedLength[:])
 
 	if _, err = w.Write(c.length[:]); err != nil {
 		return fmt.Errorf("ssh: error writing packet length: %v", err)
 	}
-
+	fmt.Printf("packet write: %+v", packet)
 	if _, err = w.Write(packet); err != nil {
 		return fmt.Errorf("ssh: error writing packet: %v", err)
 	}
@@ -488,7 +488,7 @@ func (c *chacha20Poly1305Cipher) writePacket(seqnum uint32, w io.Writer, rand io
 }
 
 func (c *chacha20Poly1305Cipher) readPacket(seqnum uint32, r io.Reader) ([]byte, error) {
-	_, err := r.Read(c.length[:])
+	_, err := io.ReadFull(r, c.encryptedLength[:])
 	if err != nil {
 		return nil, fmt.Errorf("ssh: error reading packet length: %v", err)
 	}
@@ -502,9 +502,9 @@ func (c *chacha20Poly1305Cipher) readPacket(seqnum uint32, r io.Reader) ([]byte,
 	copy(c.nonce[8:], c.seqNumBytes[:])
 
 	// Decrypt the packet length
-	chacha20.XORKeyStream(c.length[:], c.length[:], &c.nonce, &c.lenKey)
+	chacha20.XORKeyStream(c.length[:], c.encryptedLength[:], &c.nonce, &c.lenKey)
 
-	length := binary.BigEndian.Uint32(c.length[:])
+	length := binary.BigEndian.Uint32(c.length[:]) + poly1305.TagSize
 
 	if len(c.packetData) < int(length) {
 		c.packetData = make([]byte, length)
@@ -531,13 +531,13 @@ func (c *chacha20Poly1305Cipher) readPacket(seqnum uint32, r io.Reader) ([]byte,
 	copy(nonce[4:], c.seqNumBytes[:])
 
 	// Decrypt the packet payload
-	c.packetData, err = aead.Open(c.packetData[:0], nonce[:], c.packetData, nil)
+	c.packetData, err = aead.Open(c.packetData[:0], nonce[:], c.packetData, c.encryptedLength[:])
 	if err != nil {
 		return nil, fmt.Errorf("ssh: error decrypting packet: %v", err)
 	}
 	paddingLength := uint32(c.packetData[0])
 	result := c.packetData[1 : length-paddingLength-poly1305.TagSize]
-	fmt.Printf("%+v\n", result)
+	fmt.Printf("read: %+v\n", result)
 	return result, nil
 
 }
@@ -545,9 +545,9 @@ func (c *chacha20Poly1305Cipher) readPacket(seqnum uint32, r io.Reader) ([]byte,
 func (c *chacha20Poly1305Cipher) getAEAD(seqnum []byte) (cipher.AEAD, error) {
 	var polyKeyResult [64]byte
 
-	// Initialize counter to {seqnum, 0...}
+	// Initialize nonce to {0, 0..., seqnum}
 	var nonce [16]byte
-	copy(nonce[:8], seqnum)
+	copy(nonce[8:], seqnum)
 
 	// Generate the poly1305 key for payload decryption
 	chacha20.GetBlock(&polyKeyResult, &nonce, &c.key)
